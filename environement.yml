@@ -1,0 +1,14 @@
+name: usagestats
+channels:
+  - defaults
+dependencies:
+  - pandas
+  - matplotlib
+  - xlrd
+  - ipykernel
+  - openpyxl
+  - seaborn
+  - ipywidgets
+  - widgetsnbextension
+  - jupyterlab
+  - jupyterlab_widgets
