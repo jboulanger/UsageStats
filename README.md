@@ -1,4 +1,4 @@
-# Compile usage statisitcs from bookings in a calendar exported to xls files
+# Compile usage statistics from bookings in a calendar exported to xls files
 
 This notebook compiles statistics from a booking calendar exported to a set of excel xlsx files.
 
