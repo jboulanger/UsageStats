@@ -19,7 +19,7 @@ We can use Visual Studio code as an integrated environement for running the code
 The environement insures that you have all the necessary packages and isolate this configuration for the rest of the system.
 In Visual Code or in (conda) terminal:
 - Press terminal > new terminal (select a cmd terminal not Powershell)
-- Type ```C:\Software\Miniconda3\Scripts\activate C:\Software\Miniconda3\``
+- Type ```C:\Software\Miniconda3\Scripts\activate C:\Software\Miniconda3\```
 - The terminal line should start by ```(base)```
 - Create the environment ```conda env create -f environment.yml```
 - Activate the environement ```conda activate usagestats```, now the terminal should line should start with ```(usagestats)```.
