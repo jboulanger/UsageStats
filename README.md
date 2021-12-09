@@ -21,5 +21,19 @@ The following instruction for people who never used python before.
     - Select the kernel at the top right of the notebook.
     - We are ready to run the notebook
 
+## Configuration
+The notebook should be at the same level than xlsx files.
+
+## Usage
+- Open the notebook
+- Configure the input in the first cell and run all the subsequent cells (Run all) to produce the graphs and csv files.
+- If no file 'users.csv' and 'groups.csv' are present use they will be created with 'Unknown' values for groups and divisions. Check the files users.csv and groups.csv and fill out the missing values.
+- Run again the notebook to update the graphs.
 
 
+## Note
+The git repository remove the output of the notebook when staging files using a .gitattibutes files and add the following line in the .git/config file
+```
+[filter "strip-notebook-output"]
+    clean = "jupyter nbconvert --ClearOutputPreprocessor.enabled=True --to=notebook --stdin --stdout --log-level=ERROR"
+```
