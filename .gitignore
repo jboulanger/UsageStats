@@ -1,0 +1,7 @@
+*.xlsx
+*.csv
+PlotUsageStats*.py
+*.pdf
+*-checkpoint.ipynb
+.~*#
+*.ics
