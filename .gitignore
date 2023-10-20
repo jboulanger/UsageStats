@@ -5,3 +5,4 @@ PlotUsageStats*.py
 *-checkpoint.ipynb
 .~*#
 *.ics
+*/*__pycache__
