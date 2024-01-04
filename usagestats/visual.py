@@ -1,7 +1,9 @@
 import numpy as np
 
+
 def show_values_on_bars(axs, h_v="v", space=0.4, hspace=0.5):
     """from https://stackoverflow.com/questions/43214978/seaborn-barplot-displaying-values"""
+
     def _show_on_single_plot(ax):
         if h_v == "v":
             for p in ax.patches:
