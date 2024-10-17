@@ -5,6 +5,7 @@ import numpy as np
 import re
 from ics import Calendar
 import multiprocessing as mp
+from urllib import request
 
 
 def daterange(start, end, step):
@@ -226,3 +227,13 @@ def load_groups(users, groups_file):
     if n > 0:
         print(f"Edit now the {groups_file} to fill out missing groups.")
     return groups
+
+
+def download_calendars(instruments_urls, cookie):
+    """
+    Download all calendars
+
+    """
+    for row in instruments_urls.iloc:
+        req = request.Request(row["url"])
+        req.add_header(cookie)
