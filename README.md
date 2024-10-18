@@ -50,10 +50,15 @@ to remove the site specific prefix line.
 
 
 
-## Dowloading calendars
+## Downloading calendars
+Calendars are access directly using an http request. For this we need the cookie of the kerio session.
+
 - Go to kerio
 - In the top right select integrationwith..
 - Press Ctrl-Shift-E
 - Select the network tab in the developer tools
 - Right click on one item and select the Copy Value> Copy as cURL
 - in the copied text identify the section with -H 'Cookie:.....' and copy the par between quotes
+
+## Browse the database manually
+sqlitebrowser bookings.db 

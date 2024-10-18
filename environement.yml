@@ -12,3 +12,4 @@ dependencies:
   - widgetsnbextension
   - jupyterlab
   - jupyterlab_widgets
+  - ics 

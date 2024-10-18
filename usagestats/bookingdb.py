@@ -5,6 +5,8 @@ from ics import Calendar
 import pytz
 import pandas as pd
 import multiprocessing as mp
+from urllib import request
+from functools import partial
 
 
 def load_ics(args):
@@ -38,6 +40,40 @@ def load_ics(args):
     return df
 
 
+def download_calendar(url, cookie):
+    """
+    Download a calendars and store the content as a dataframe
+
+    """
+    id, filename = args
+    local_tz = pytz.timezone("Europe/London")
+    req = request.Request(url)
+    req.add_header(cookie)
+    rec = []
+    with request.urlopen(req) as response:
+        c = Calendar(response.read())
+        for k, e in enumerate(c.events):
+            if e.organizer is not None:
+                t0 = e.begin.datetime.replace(tzinfo=local_tz)
+                t1 = e.end.datetime.replace(tzinfo=local_tz)
+                if e.name is not None:
+                    subject = e.name.lower().replace("maintenace", "maintenance")
+                else:
+                    subject = "None"
+                rec.append(
+                    {
+                        "user": e.organizer.common_name,
+                        "email": e.organizer.email,
+                        "start": t0,
+                        "end": t1,
+                        "subject": subject,
+                        "duration": t1 - t0,
+                        "hours": (t1 - t0).total_seconds() / 3600,
+                    }
+                )
+    return pd.DataFrame.from_records(rec)
+
+
 class BookingDB:
     """Bookings class
 
@@ -50,10 +86,12 @@ class BookingDB:
     ```
     """
 
-    def __init__(self, db_file):
+    def __init__(self, db_file, cookie=None, curl_str=None):
         self.db_file = db_file
         self.connection = sqlite3.connect(self.db_file)
         self.cursor = self.connection.cursor()
+        self.cookie = cookie
+        self.set_cookie_from_curl(curl_str)
 
     def __enter__(self):
         return self
@@ -160,26 +198,49 @@ class BookingDB:
             except Error:
                 pass
 
-    def create_instruments(self, instruments):
-        """Create the instrument table from a dataframe"""
+    def create_calendars_from_df(self, calendars):
+        """Create the calendar table from a dataframe"""
         self.cursor.execute(
-            """CREATE TABLE IF NOT EXISTS instruments (
+            """CREATE TABLE IF NOT EXISTS calendars (
                 id integer PRIMARY KEY,
-                name text UNIQUE,
-                path text
+                url text UNIQUE,
+                instrument text
                 )"""
         )
         self.connection.commit()
-
-        for row in instruments.iloc:
+        for row in calendars.iloc:
             try:
                 self.cursor.execute(
-                    """INSERT INTO instruments (name, url) VALUES (?,?)""",
-                    (self.calendar_to_instrument_name(fpath), str(fpath)),
+                    """INSERT INTO calendars (url, instrument) VALUES (?,?)""",
+                    (row["url"], row["instrument"]),
                 )
                 self.connection.commit()
-            except Error:
-                pass  # print(e)
+            except Error as e:
+                # print(e)
+                pass
+
+    def create_instruments(self):
+        """Create the instruments table from the calendars table"""
+
+        self.cursor.execute(
+            """CREATE TABLE IF NOT EXISTS instruments (
+                id integer PRIMARY KEY,
+                name text UNIQUE
+                )"""
+        )
+
+        self.cursor.execute("""SELECT instrument FROM calendars""")
+        rows = self.cursor.fetchall()
+        for row in rows:
+            try:
+                self.cursor.execute(
+                    """INSERT INTO instruments (name) VALUES (?)""",
+                    (row[0],),
+                )
+                self.connection.commit()
+            except Error as e:
+                # print(e)
+                pass  #
 
     def get_booking_type(self, x):
         """Get the type of booking by matching test from type list"""
@@ -194,7 +255,7 @@ class BookingDB:
 
     def get_instrument_id(self, x):
         """Get the type of booking by matching test from type list"""
-        self.cursor.execute("""SELECT rowid,name FROM intruments WHERE name=?""", (x,))
+        self.cursor.execute("""SELECT rowid,name FROM instruments WHERE name=?""", (x,))
         row = self.cursor.fetchone()
         if row is None:
             return 1
@@ -258,13 +319,15 @@ class BookingDB:
 
     def create_events(self):
         # get the list of instruments
-        self.cursor.execute("""SELECT rowid, path FROM instruments""")
+        self.cursor.execute("""SELECT instrument, url FROM calendars""")
         rows = self.cursor.fetchall()
 
-        # for each instrument load the calendar as a dataframe
-        with mp.Pool() as pool:
-            df = pool.map(load_ics, rows, chunksize=1)
-        df = pd.concat(df)
+        # load all calendars as a dataframe
+        # with mp.Pool() as pool:
+        #    df = pool.map(partial(load_calendar, cookie=self.cookie), rows, chunksize=1)
+        #
+        #    df = pd.concat(df)
+        df = pd.concat([self.load_calendar(r[0], r[1]) for r in rows])
 
         # get the users from the list of events
         users = df[["user", "email"]].drop_duplicates()
@@ -272,6 +335,8 @@ class BookingDB:
         self.create_users(users)
 
         # create event table
+        # add thus UNIQUE(instrument_id, start),
+        # to ensure that there is inly one booking and one start at a time
         self.cursor.execute(
             """CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY,
@@ -282,7 +347,6 @@ class BookingDB:
                 end TEXT,
                 duration REAL,
                 subject TEXT,
-                UNIQUE(instrument_id, start),
                 FOREIGN KEY (user_id) REFERENCES users (id)
                 FOREIGN KEY (instrument_id) REFERENCES instruments (id)
             )"""
@@ -293,7 +357,7 @@ class BookingDB:
         for e in df.iloc:
             try:
                 uid = int(self.get_user_id(e["email"]))
-                iid = int(e["instrument_id"])
+                iid = int(self.get_instrument_id(e["instrument"]))
                 bid = int(self.get_booking_type(e["subject"]))
                 self.cursor.execute(
                     """INSERT INTO events (
@@ -320,3 +384,100 @@ class BookingDB:
                 print("error in events", e)
 
         return df
+
+    def load_calendar(self, instrument, url):
+        print(instrument)
+        try:
+            local_tz = pytz.timezone("Europe/London")
+            req = request.Request(url)
+            req.add_header("Cookie", self.cookie)
+            rec = []
+            with request.urlopen(req) as response:
+                txt = response.read().decode("utf-8")
+                c = Calendar(txt)
+                for k, e in enumerate(c.events):
+                    if e.organizer is not None:
+                        t0 = e.begin.datetime.replace(tzinfo=local_tz)
+                        t1 = e.end.datetime.replace(tzinfo=local_tz)
+                        if e.name is not None:
+                            subject = e.name.lower().replace(
+                                "maintenace", "maintenance"
+                            )
+                        else:
+                            subject = "None"
+                        rec.append(
+                            {
+                                "user": e.organizer.common_name,
+                                "email": e.organizer.email,
+                                "start": t0,
+                                "end": t1,
+                                "subject": subject,
+                                "duration": t1 - t0,
+                                "hours": (t1 - t0).total_seconds() / 3600,
+                            }
+                        )
+            df = pd.DataFrame.from_records(rec)
+            df["instrument"] = instrument
+            return df
+        except Exception as e:
+            print(f"Cound not download {url}")
+            print(e)
+            return None
+
+    def set_cookie_from_curl(self, curl_str):
+        if curl_str is not None:
+            x = curl_str.split(" ")
+            k = x.index("'Cookie:")
+            if k > 0:
+                self.cookie = " ".join(x[k + 1 : k + 3])
+            else:
+                raise Exception("Cookie not fount in curl string")
+
+
+def load_calendar(args, cookie):
+    """
+    Download a calendars and store the content as a dataframe
+
+    Note
+    ----
+    This is an independant function to be able to be parallelized
+
+    """
+    name, url = args
+    print(name, url)
+    local_tz = pytz.timezone("Europe/London")
+    req = request.Request(url)
+    req.add_header("Cookie", cookie)
+    req.add_header("Accept", "text/html")
+    req.add_header("Sec-Fetch-Dest", "document")
+    req.add_header("Connection", "keep-alive")
+    rec = []
+    with request.urlopen(req) as response:
+        txt = response.read().decode("utf-8")
+    with open("dump.txt", "w") as f:
+        f.write(txt)
+    with open("dump.txt", "r") as f:
+        txt = f.readlines()
+        c = Calendar(f.read())
+        for k, e in enumerate(c.events):
+            if e.organizer is not None:
+                t0 = e.begin.datetime.replace(tzinfo=local_tz)
+                t1 = e.end.datetime.replace(tzinfo=local_tz)
+                if e.name is not None:
+                    subject = e.name.lower().replace("maintenace", "maintenance")
+                else:
+                    subject = "None"
+                rec.append(
+                    {
+                        "user": e.organizer.common_name,
+                        "email": e.organizer.email,
+                        "start": t0,
+                        "end": t1,
+                        "subject": subject,
+                        "duration": t1 - t0,
+                        "hours": (t1 - t0).total_seconds() / 3600,
+                    }
+                )
+    df = pd.DataFrame.from_records(rec)
+    df["instrument"] = name
+    return df
