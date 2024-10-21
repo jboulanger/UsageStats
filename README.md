@@ -54,11 +54,14 @@ to remove the site specific prefix line.
 Calendars are access directly using an http request. For this we need the cookie of the kerio session.
 
 - Go to kerio
-- In the top right select integrationwith..
-- Press Ctrl-Shift-E
+- Press Ctrl-Shift-E to open the developer tools
 - Select the network tab in the developer tools
-- Right click on one item and select the Copy Value> Copy as cURL
-- in the copied text identify the section with -H 'Cookie:.....' and copy the par between quotes
+- Right-click on one item and select the "Copy Value> Copy as cURL"
+- Paste the text in a text file cookies.txt
+
+## Duplicates
+The calendars have GUID that 'uniquely' identify booking events. 
+However, modified events and group booking share the same GUID.
 
 ## Browse the database manually
 sqlitebrowser bookings.db 

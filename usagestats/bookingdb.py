@@ -26,6 +26,7 @@ def load_ics(args):
                     subject = "None"
                 rec.append(
                     {
+                        "guid": e.uid,
                         "user": e.organizer.common_name,
                         "email": e.organizer.email,
                         "start": t0,
@@ -38,40 +39,6 @@ def load_ics(args):
     df = pd.DataFrame(rec)
     df["instrument_id"] = id
     return df
-
-
-def download_calendar(url, cookie):
-    """
-    Download a calendars and store the content as a dataframe
-
-    """
-    id, filename = args
-    local_tz = pytz.timezone("Europe/London")
-    req = request.Request(url)
-    req.add_header(cookie)
-    rec = []
-    with request.urlopen(req) as response:
-        c = Calendar(response.read())
-        for k, e in enumerate(c.events):
-            if e.organizer is not None:
-                t0 = e.begin.datetime.replace(tzinfo=local_tz)
-                t1 = e.end.datetime.replace(tzinfo=local_tz)
-                if e.name is not None:
-                    subject = e.name.lower().replace("maintenace", "maintenance")
-                else:
-                    subject = "None"
-                rec.append(
-                    {
-                        "user": e.organizer.common_name,
-                        "email": e.organizer.email,
-                        "start": t0,
-                        "end": t1,
-                        "subject": subject,
-                        "duration": t1 - t0,
-                        "hours": (t1 - t0).total_seconds() / 3600,
-                    }
-                )
-    return pd.DataFrame.from_records(rec)
 
 
 class BookingDB:
@@ -327,7 +294,9 @@ class BookingDB:
         #    df = pool.map(partial(load_calendar, cookie=self.cookie), rows, chunksize=1)
         #
         #    df = pd.concat(df)
-        df = pd.concat([self.load_calendar(r[0], r[1]) for r in rows])
+        df = pd.concat(
+            [self.load_calendar(r[0], r[1]) for r in rows], ignore_index=True
+        )
 
         # get the users from the list of events
         users = df[["user", "email"]].drop_duplicates()
@@ -335,11 +304,13 @@ class BookingDB:
         self.create_users(users)
 
         # create event table
-        # add thus UNIQUE(instrument_id, start),
+        # add UNIQUE(guid),
         # to ensure that there is inly one booking and one start at a time
+        # sqliste does not have global unique id
         self.cursor.execute(
             """CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY,
+                guid TEXT UNIQUE,
                 user_id INTEGER,
                 instrument_id INTEGER,
                 booking_type_id INTEGER,
@@ -354,13 +325,15 @@ class BookingDB:
         self.connection.commit()
 
         # insert events
-        for e in df.iloc:
+        duplicates = []
+        for event in df.iloc:
             try:
-                uid = int(self.get_user_id(e["email"]))
-                iid = int(self.get_instrument_id(e["instrument"]))
-                bid = int(self.get_booking_type(e["subject"]))
+                uid = int(self.get_user_id(event["email"]))
+                iid = int(self.get_instrument_id(event["instrument"]))
+                bid = int(self.get_booking_type(event["subject"]))
                 self.cursor.execute(
                     """INSERT INTO events (
+                        guid, 
                         user_id,
                         instrument_id,
                         booking_type_id,
@@ -368,22 +341,24 @@ class BookingDB:
                         end,
                         duration,
                         subject
-                        ) VALUES (?,?,?,?,?,?,?)""",
+                        ) VALUES (?,?,?,?,?,?,?,?)""",
                     (
+                        event["guid"],
                         uid,
                         iid,
                         bid,
-                        str(e["start"]),
-                        str(e["end"]),
-                        float(e["hours"]),
-                        e["subject"],
+                        str(event["start"]),
+                        str(event["end"]),
+                        float(event["hours"]),
+                        event["subject"],
                     ),
                 )
                 self.connection.commit()
-            except Error as e:
-                print("error in events", e)
+            except Error as error:
+                # print("error in events", error, event["guid"])
+                duplicates.append(event["guid"])
 
-        return df
+        return df, duplicates
 
     def load_calendar(self, instrument, url):
         print(instrument)
@@ -407,6 +382,7 @@ class BookingDB:
                             subject = "None"
                         rec.append(
                             {
+                                "guid": e.uid,
                                 "user": e.organizer.common_name,
                                 "email": e.organizer.email,
                                 "start": t0,
@@ -432,52 +408,3 @@ class BookingDB:
                 self.cookie = " ".join(x[k + 1 : k + 3])
             else:
                 raise Exception("Cookie not fount in curl string")
-
-
-def load_calendar(args, cookie):
-    """
-    Download a calendars and store the content as a dataframe
-
-    Note
-    ----
-    This is an independant function to be able to be parallelized
-
-    """
-    name, url = args
-    print(name, url)
-    local_tz = pytz.timezone("Europe/London")
-    req = request.Request(url)
-    req.add_header("Cookie", cookie)
-    req.add_header("Accept", "text/html")
-    req.add_header("Sec-Fetch-Dest", "document")
-    req.add_header("Connection", "keep-alive")
-    rec = []
-    with request.urlopen(req) as response:
-        txt = response.read().decode("utf-8")
-    with open("dump.txt", "w") as f:
-        f.write(txt)
-    with open("dump.txt", "r") as f:
-        txt = f.readlines()
-        c = Calendar(f.read())
-        for k, e in enumerate(c.events):
-            if e.organizer is not None:
-                t0 = e.begin.datetime.replace(tzinfo=local_tz)
-                t1 = e.end.datetime.replace(tzinfo=local_tz)
-                if e.name is not None:
-                    subject = e.name.lower().replace("maintenace", "maintenance")
-                else:
-                    subject = "None"
-                rec.append(
-                    {
-                        "user": e.organizer.common_name,
-                        "email": e.organizer.email,
-                        "start": t0,
-                        "end": t1,
-                        "subject": subject,
-                        "duration": t1 - t0,
-                        "hours": (t1 - t0).total_seconds() / 3600,
-                    }
-                )
-    df = pd.DataFrame.from_records(rec)
-    df["instrument"] = name
-    return df
