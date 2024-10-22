@@ -2,11 +2,20 @@ import sqlite3
 from sqlite3 import Error
 import re
 from ics import Calendar
+from datetime import datetime, timedelta
 import pytz
 import pandas as pd
 import multiprocessing as mp
 from urllib import request
 from functools import partial
+
+
+def daterange(start, end, step):
+    """Range of dates generator"""
+    curr = start
+    while curr < end:
+        yield curr
+        curr += step
 
 
 def load_ics(args):
@@ -171,19 +180,26 @@ class BookingDB:
             """CREATE TABLE IF NOT EXISTS calendars (
                 id integer PRIMARY KEY,
                 url text UNIQUE,
-                instrument text
+                instrument text,
+                pc integer,
+                confocal integer
                 )"""
         )
         self.connection.commit()
         for row in calendars.iloc:
             try:
                 self.cursor.execute(
-                    """INSERT INTO calendars (url, instrument) VALUES (?,?)""",
-                    (row["url"], row["instrument"]),
+                    """INSERT INTO calendars (url, instrument, pc, confocal) VALUES (?,?,?,?)""",
+                    (
+                        row["url"],
+                        row["instrument"],
+                        int(row["pc"]),
+                        int(row["confocal"]),
+                    ),
                 )
                 self.connection.commit()
             except Error as e:
-                # print(e)
+                print(e)
                 pass
 
     def create_instruments(self):
@@ -229,6 +245,39 @@ class BookingDB:
         else:
             return row[0]
 
+    def get_usage(self, week, bookings):
+        """Get the amount of usage in hours per week"""
+        print(week)
+        s = 0.0
+        for booking in bookings.iloc:
+            d = (
+                min(booking["end"], week["End"]) - max(booking["start"], week["Start"])
+            ).total_seconds()
+            if d > 0.0:
+                s += d / 3600.0
+        return s
+
+    def get_weekly_usage(self, events, start_date, end_date):
+        weeks_start = [d for d in daterange(start_date, end_date, timedelta(days=7))]
+        df = pd.DataFrame(
+            {
+                "Week": pd.Series(range(1, len(weeks_start) + 1)),
+                "Start": weeks_start,
+            }
+        )
+        df["End"] = df["Start"] + timedelta(days=7)
+        df["Usage"] = [self.get_usage(w, events) for w in df.iloc]
+        return df
+
+    def weekly_usage_by_instrument(self, start_date, end_date):
+        events = self.get_events_in_range(start_date, end_date)
+        usage = []
+        for name, group in events.groupby("instrument"):
+            u = self.get_weekly_usage(group, start_date, end_date)
+            u["Instrument"] = name
+            usage.append(u)
+        return pd.concat(usage)
+
     def get_group_id(self, x):
         """Get the type of group by matching test from type list"""
         self.cursor.execute("""SELECT id FROM groups WHERE name=?""", (x,))
@@ -239,7 +288,14 @@ class BookingDB:
             return row[0]
 
     def create_users(self, users):
-        # create the users table
+        """
+        create the users table
+
+        Parameters
+        ----------
+        users: pd.Dataframe
+            dataframe with user, email, group
+        """
         self.cursor.execute(
             """CREATE TABLE IF NOT EXISTS users (
                 id integer PRIMARY KEY,
@@ -263,6 +319,31 @@ class BookingDB:
             except Error:
                 pass
 
+    def get_unique_users_in_range(self, start_date, end_date):
+        """
+        Get the user table as dataframe
+
+        """
+        q = (
+            """
+        SELECT DISTINCT
+            users.name,
+            users.email,
+            groups.name as 'group',
+            divisions.name as 'division'
+        FROM users
+        INNER JOIN groups ON users.group_id=groups.id
+        INNER JOIN divisions ON groups.division_id=divisions.id
+        INNER JOIN events ON users.id=events.user_id
+        WHERE start>date('"""
+            + start_date.isoformat(sep=" ")
+            + """') and
+                end<date('"""
+            + end_date.isoformat(sep=" ")
+            + """') """
+        )
+        return pd.read_sql_query(q, self.connection)
+
     def get_user_id(self, email):
         """Get the type of group by matching test from type list"""
         self.cursor.execute("""SELECT id FROM users WHERE email=?""", (email,))
@@ -275,16 +356,62 @@ class BookingDB:
     def update_users_group_from_df(self, df):
         """update groups in user table from a dataframe with columns Group and User"""
         for u in df.iloc:
-            gid = self.get_group_id(u["Group"])
+            gid = self.get_group_id(u["group"])
             self.cursor.execute(
                 """UPDATE users
                    SET group_id = ?
                    WHERE name = ?""",
-                (gid, u["User"]),
+                (gid, u["user"]),
             )
             self.connection.commit()
 
-    def create_events(self):
+    def get_events_in_range(self, start_date, end_date):
+        """Get all events in date range
+
+        Parameters
+        ----------
+        start_date: str
+            start date as iso-format data yyyy-mm-dd
+        end_date: str
+            end date as iso-format data yyyy-mm-dd
+        """
+
+        q = (
+            """
+            SELECT 
+                events.duration AS 'hours', 
+                events.start AS 'start',
+                events.end AS 'end',
+                users.name AS 'user',
+                groups.name AS 'group',
+                divisions.name AS 'division',
+                instruments.name as 'instrument',
+                booking_types.name as 'type',
+                events.subject
+            FROM events 
+            INNER JOIN users ON events.user_id=users.id
+            INNER JOIN groups ON users.group_id=groups.id
+            INNER JOIN divisions ON groups.division_id=divisions.id
+            INNER JOIN instruments ON instrument_id=instruments.id
+            INNER JOIN booking_types ON booking_type_id=booking_types.id
+            WHERE start>date('"""
+            + start_date.isoformat(sep=" ")
+            + """') and
+                  end<date('"""
+            + end_date.isoformat(sep=" ")
+            + """') """
+        )
+
+        events = pd.read_sql_query(
+            q,
+            self.connection,
+        )
+
+        events["start"] = pd.to_datetime(events["start"], utc=True)
+        events["end"] = pd.to_datetime(events["end"], utc=True)
+        return events
+
+    def create_events(self, users):
         # get the list of instruments
         self.cursor.execute("""SELECT instrument, url FROM calendars""")
         rows = self.cursor.fetchall()
@@ -298,10 +425,15 @@ class BookingDB:
             [self.load_calendar(r[0], r[1]) for r in rows], ignore_index=True
         )
 
-        # get the users from the list of events
-        users = df[["user", "email"]].drop_duplicates()
-        users["group"] = "Unknown"
-        self.create_users(users)
+        # get the users from the list of events merge with known users
+        all_users = (
+            df[["user", "email"]]
+            .drop_duplicates()
+            .merge(users, how="left", on="user")
+            .fillna("Unknown")
+        )
+
+        self.create_users(all_users)
 
         # create event table
         # add UNIQUE(guid),

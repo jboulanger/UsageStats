@@ -229,11 +229,4 @@ def load_groups(users, groups_file):
     return groups
 
 
-def download_calendars(instruments_urls, cookie):
-    """
-    Download all calendars
 
-    """
-    for row in instruments_urls.iloc:
-        req = request.Request(row["url"])
-        req.add_header(cookie)

@@ -7,3 +7,4 @@ PlotUsageStats*.py
 *.ics
 */*__pycache__
 *.db
+cookie.txt
