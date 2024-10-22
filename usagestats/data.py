@@ -227,6 +227,3 @@ def load_groups(users, groups_file):
     if n > 0:
         print(f"Edit now the {groups_file} to fill out missing groups.")
     return groups
-
-
-
