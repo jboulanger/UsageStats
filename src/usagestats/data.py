@@ -1,9 +1,10 @@
-import pandas as pd
-from datetime import datetime, timedelta
-import pytz
-import re
-from ics import Calendar
 import multiprocessing as mp
+import re
+from datetime import datetime, timedelta
+
+import pandas as pd
+import pytz
+from icalendar import Calendar
 
 
 def daterange(start, end, step):
@@ -144,20 +145,34 @@ def load_ics(
         dataframe with User, Start, End, Subject
     """
     local_tz = pytz.timezone("Europe/London")
-    with open(filename) as f:
-        c = Calendar(f.read())
+    with open(filename, encoding="utf-8") as f:
+        c = Calendar.from_ical(f.read())
         rec = []
-        for k, e in enumerate(c.events):
-            if e.organizer is not None:
-                t0 = e.begin.datetime.replace(tzinfo=local_tz)
-                t1 = e.end.datetime.replace(tzinfo=local_tz)
-                if e.name is not None:
-                    subject = e.name.lower().replace("maintenace", "maintenance")
+        for e in c.walk("VEVENT"):
+            organizer = e.get("ORGANIZER")
+            if organizer is not None:
+                dtstart = e.get("DTSTART").dt
+                dtend = e.get("DTEND").dt
+                t0 = (
+                    dtstart.astimezone(local_tz)
+                    if hasattr(dtstart, "astimezone")
+                    else local_tz.localize(dtstart)
+                )
+                t1 = (
+                    dtend.astimezone(local_tz)
+                    if hasattr(dtend, "astimezone")
+                    else local_tz.localize(dtend)
+                )
+                raw_summary = e.get("SUMMARY")
+                if raw_summary is not None:
+                    subject = str(raw_summary).lower().replace("maintenace", "maintenance")
                 else:
                     subject = "None"
+                org_email = str(organizer).replace("mailto:", "").replace("MAILTO:", "")
+                common_name = organizer.params.get("CN", org_email) if hasattr(organizer, "params") else org_email
                 rec.append(
                     {
-                        "User": e.organizer.common_name,
+                        "User": common_name,
                         "Start": t0,
                         "End": t1,
                         "Subject": subject,

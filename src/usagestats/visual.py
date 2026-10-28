@@ -1,6 +1,7 @@
+from datetime import timedelta
+
 import numpy as np
 import pandas as pd
-from datetime import timedelta
 
 
 def show_values_on_bars(axs, h_v="v", space=1, hspace=0.4):

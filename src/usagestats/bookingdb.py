@@ -1,17 +1,15 @@
-import multiprocessing as mp
 import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
-from functools import partial
+from datetime import timedelta
 from pathlib import Path
 from sqlite3 import Error
 from urllib import request
 
 import pandas as pd
 import pytz
-from ics import Calendar
+from icalendar import Calendar
 
 
 def daterange(start, end, step):
@@ -54,21 +52,41 @@ def load_ics(args):
     id, filename = args
     local_tz = pytz.timezone("Europe/London")
     rec = []
-    with open(filename) as f:
-        c = Calendar(f.read())
-        for k, e in enumerate(c.events):
-            if e.organizer is not None:
-                t0 = e.begin.datetime.replace(tzinfo=local_tz)
-                t1 = e.end.datetime.replace(tzinfo=local_tz)
-                if e.name is not None:
-                    subject = e.name.lower().replace("maintenace", "maintenance")
+    with open(filename, encoding="utf-8") as f:
+        c = Calendar.from_ical(f.read())
+        for e in c.walk("VEVENT"):
+            organizer = e.get("ORGANIZER")
+            if organizer is not None:
+                dtstart = e.get("DTSTART").dt
+                dtend = e.get("DTEND").dt
+                t0 = (
+                    dtstart.astimezone(local_tz)
+                    if hasattr(dtstart, "astimezone")
+                    else local_tz.localize(dtstart)
+                )
+                t1 = (
+                    dtend.astimezone(local_tz)
+                    if hasattr(dtend, "astimezone")
+                    else local_tz.localize(dtend)
+                )
+                raw_summary = e.get("SUMMARY")
+                if raw_summary is not None:
+                    subject = (
+                        str(raw_summary).lower().replace("maintenace", "maintenance")
+                    )
                 else:
                     subject = "None"
+                org_email = str(organizer).replace("mailto:", "").replace("MAILTO:", "")
+                common_name = (
+                    organizer.params.get("CN", org_email)
+                    if hasattr(organizer, "params")
+                    else org_email
+                )
                 rec.append(
                     {
-                        "guid": e.uid,
-                        "user": e.organizer.common_name,
-                        "email": e.organizer.email,
+                        "guid": str(e.get("UID")),
+                        "user": common_name,
+                        "email": org_email,
                         "start": t0,
                         "end": t1,
                         "subject": subject,
@@ -194,7 +212,7 @@ class BookingDB:
 
         try:
             self.cursor.execute(
-                """INSERT INTO divisions (id,name) VALUES (1,Unknown)"""
+                """INSERT INTO divisions (id, name) VALUES (1, 'Unknown')"""
             )
         except Error:
             pass
@@ -255,7 +273,7 @@ class BookingDB:
 
         try:
             self.cursor.execute(
-                """INSERT INTO groups (id,name,division_id) VALUES (1,Unknown,1)"""
+                """INSERT INTO groups (id, name, division_id) VALUES (1, 'Unknown', 1)"""
             )
         except Error:
             pass
@@ -311,7 +329,6 @@ class BookingDB:
                 self.connection.commit()
             except Error as e:
                 print(e)
-                pass
 
     def create_instruments(self):
         """Create the instruments table from the calendars table
@@ -337,7 +354,7 @@ class BookingDB:
                     (row[0],),
                 )
                 self.connection.commit()
-            except Error as e:
+            except Error:
                 # print(e)
                 pass
 
@@ -469,51 +486,63 @@ class BookingDB:
                 name text,
                 group_id integer,
                 email text UNIQUE,
-                FOREIGN KEY (group_id) REFERENCES group_id (id)
+                FOREIGN KEY (group_id) REFERENCES groups (id)
             )"""
         )
         self.connection.commit()
+
+        # pre-load groups into memory for fast lookup
+        self.cursor.execute("""SELECT name, id FROM groups""")
+        group_map = dict(self.cursor.fetchall())
+
+        user_records = []
         for u in users.iloc:
-            try:
-                gid = self.get_group_id(u["group"])
-                name = u["user"]
-                email = u["email"]
-                self.cursor.execute(
-                    """INSERT INTO users (name,group_id,email) VALUES (?,?,?)""",
-                    (name, gid, email),
-                )
-                self.connection.commit()
-            except Error:
-                pass
+            gid = group_map.get(u["group"], 0)
+            name = u["user"]
+            email = str(u["email"]).split("@")[0] if pd.notna(u["email"]) else ""
+            user_records.append((name, gid, email))
+
+        if user_records:
+            self.cursor.executemany(
+                """INSERT OR IGNORE INTO users (name, group_id, email) VALUES (?,?,?)""",
+                user_records,
+            )
+            self.connection.commit()
 
     def get_unique_users_in_range(self, start_date, end_date):
         """
         Get the user table as dataframe
 
         """
-        q = (
-            """
-        SELECT DISTINCT
-            users.name,
-            users.email,
-            groups.name as 'group',
-            divisions.name as 'division'
-        FROM users
-        INNER JOIN groups ON users.group_id=groups.id
-        INNER JOIN divisions ON groups.division_id=divisions.id
-        INNER JOIN events ON users.id=events.user_id
-        WHERE start>date('"""
-            + start_date.isoformat(sep=" ")
-            + """') and
-                end<date('"""
-            + end_date.isoformat(sep=" ")
-            + """') """
+        start_str = (
+            start_date.isoformat(sep=" ")
+            if hasattr(start_date, "isoformat")
+            else str(start_date)
         )
-        return pd.read_sql_query(q, self.connection)
+        end_str = (
+            end_date.isoformat(sep=" ")
+            if hasattr(end_date, "isoformat")
+            else str(end_date)
+        )
+        q = """
+        SELECT DISTINCT
+            COALESCE(users.name, 'Unknown') as 'name',
+            COALESCE(users.email, 'Unknown') as 'email',
+            COALESCE(groups.name, 'Unknown') as 'group',
+            COALESCE(divisions.name, 'Unknown') as 'division'
+        FROM events
+        INNER JOIN users ON events.user_id = users.id
+        LEFT JOIN groups ON users.group_id = groups.id
+        LEFT JOIN divisions ON groups.division_id = divisions.id
+        WHERE datetime(events.start) >= datetime(?)
+          AND datetime(events.end) <= datetime(?)
+        """
+        return pd.read_sql_query(q, self.connection, params=(start_str, end_str))
 
     def get_user_id(self, email):
-        """Get the type of group by matching test from type list"""
-        self.cursor.execute("""SELECT id FROM users WHERE email=?""", (email,))
+        """Get the user id by matching email (or username before @)"""
+        user_key = str(email).split("@")[0] if pd.notna(email) else ""
+        self.cursor.execute("""SELECT id FROM users WHERE email=?""", (user_key,))
         row = self.cursor.fetchone()
         if row is None:
             return 0
@@ -537,42 +566,48 @@ class BookingDB:
 
         Parameters
         ----------
-        start_date: str
-            start date as iso-format data yyyy-mm-dd
-        end_date: str
-            end date as iso-format data yyyy-mm-dd
+        start_date: str or datetime
+            start date as iso-format data yyyy-mm-dd or datetime
+        end_date: str or datetime
+            end date as iso-format data yyyy-mm-dd or datetime
         """
+        start_str = (
+            start_date.isoformat(sep=" ")
+            if hasattr(start_date, "isoformat")
+            else str(start_date)
+        )
+        end_str = (
+            end_date.isoformat(sep=" ")
+            if hasattr(end_date, "isoformat")
+            else str(end_date)
+        )
 
-        q = (
-            """
+        q = """
             SELECT 
                 events.duration AS 'hours', 
                 events.start AS 'start',
                 events.end AS 'end',
-                users.name AS 'user',
-                users.email as 'email',
-                groups.name AS 'group',
-                divisions.name AS 'division',
-                instruments.name as 'instrument',
-                booking_types.name as 'type',
+                COALESCE(users.name, 'Unknown') AS 'user',
+                COALESCE(users.email, 'Unknown') AS 'email',
+                COALESCE(groups.name, 'Unknown') AS 'group',
+                COALESCE(divisions.name, 'Unknown') AS 'division',
+                COALESCE(instruments.name, 'Unknown') AS 'instrument',
+                COALESCE(booking_types.name, 'default') AS 'type',
                 events.subject
             FROM events 
-            INNER JOIN users ON events.user_id=users.id
-            INNER JOIN groups ON users.group_id=groups.id
-            INNER JOIN divisions ON groups.division_id=divisions.id
-            INNER JOIN instruments ON instrument_id=instruments.id
-            INNER JOIN booking_types ON booking_type_id=booking_types.id
-            WHERE start>date('"""
-            + start_date.isoformat(sep=" ")
-            + """') and
-                  end<date('"""
-            + end_date.isoformat(sep=" ")
-            + """') """
-        )
+            LEFT JOIN users ON events.user_id = users.id
+            LEFT JOIN groups ON users.group_id = groups.id
+            LEFT JOIN divisions ON groups.division_id = divisions.id
+            LEFT JOIN instruments ON events.instrument_id = instruments.id
+            LEFT JOIN booking_types ON events.booking_type_id = booking_types.id
+            WHERE datetime(events.start) >= datetime(?)
+              AND datetime(events.end) <= datetime(?)
+        """
 
         events = pd.read_sql_query(
             q,
             self.connection,
+            params=(start_str, end_str),
         )
 
         events["start"] = pd.to_datetime(events["start"], utc=True)
@@ -613,11 +648,11 @@ class BookingDB:
         if not rows:
             df = pd.DataFrame(columns=columns)
         else:
-            with ThreadPoolExecutor(max_workers=min(4, len(rows))) as pool:
+            with ThreadPoolExecutor(max_workers=min(8, len(rows))) as pool:
                 futures = []
                 for i, row in enumerate(rows):
                     if i > 0:
-                        time.sleep(1.0)
+                        time.sleep(1.0)  # stagger the requests
                     futures.append(pool.submit(self.load_calendar, row[0], row[1]))
                 frames = []
                 for future in as_completed(futures):
@@ -675,60 +710,81 @@ class BookingDB:
             )"""
         )
         print("create events")
-        # insert events
+        # pre-load mappings into memory for O(1) lookups
+        self.cursor.execute("""SELECT email, id FROM users""")
+        user_map = dict(self.cursor.fetchall())
+
+        self.cursor.execute("""SELECT name, rowid FROM instruments""")
+        instrument_map = dict(self.cursor.fetchall())
+
+        self.cursor.execute("""SELECT name, id FROM booking_types""")
+        booking_type_map = {name.lower(): b_id for name, b_id in self.cursor.fetchall()}
+
+        self.cursor.execute("""SELECT guid FROM events""")
+        existing_guids = {row[0] for row in self.cursor.fetchall()}
+
         duplicates = []
+        events_to_insert = []
+        attendees_to_insert = []
+
         for event in df.iloc:
+            guid = event["guid"]
             # check if the event already exists
-            self.cursor.execute(
-                """SELECT id FROM events WHERE guid=?""",
-                (event["guid"],),
-            )
-            if self.cursor.fetchone() is not None:
-                # if it exists, skip it
-                duplicates.append(event["guid"])
+            if guid in existing_guids:
+                duplicates.append(guid)
                 continue
-            try:
-                uid = int(self.get_user_id(event["email"]))
-                iid = int(self.get_instrument_id(event["instrument"]))
-                bid = int(self.get_booking_type(event["subject"]))
-                self.cursor.execute(
-                    """INSERT INTO events (
-                        guid, 
-                        user_id,
-                        instrument_id,
-                        booking_type_id,
-                        start,
-                        end,
-                        duration,
-                        subject
-                        ) VALUES (?,?,?,?,?,?,?,?)""",
-                    (
-                        event["guid"],
-                        uid,
-                        iid,
-                        bid,
-                        str(event["start"]),
-                        str(event["end"]),
-                        float(event["hours"]),
-                        event["subject"],
-                    ),
+
+            existing_guids.add(guid)
+            org_key = (
+                str(event["email"]).split("@")[0] if pd.notna(event["email"]) else ""
+            )
+            uid = int(user_map.get(org_key, user_map.get(event["email"], 0)))
+            iid = int(instrument_map.get(event["instrument"], 1))
+            bid = int(booking_type_map.get(str(event["subject"]).lower(), 1))
+
+            events_to_insert.append(
+                (
+                    guid,
+                    uid,
+                    iid,
+                    bid,
+                    str(event["start"]),
+                    str(event["end"]),
+                    float(event["hours"]),
+                    event["subject"],
                 )
-                self.connection.commit()
-            except Error:
-                # print("error in events", error, event["guid"])
-                duplicates.append(event["guid"])
+            )
 
-            # insert attendees of the event to the attendees table
-            # if the user is not in the users table, it will be skipped
+            # collect attendees of the event
             for attendee in event["attendees"]:
-                uid = self.get_user_id(attendee)
-                if uid > 0:
-                    self.cursor.execute(
-                        """INSERT INTO attendees (event_id, user_id) VALUES (?,?)""",
-                        (event["guid"], uid),
-                    )
-                    self.connection.commit()
+                att_key = str(attendee).split("@")[0] if pd.notna(attendee) else ""
+                a_uid = user_map.get(att_key, user_map.get(attendee, 0))
+                if a_uid > 0:
+                    attendees_to_insert.append((guid, a_uid))
 
+        # batch insert events and attendees with a single transaction commit
+        if events_to_insert:
+            self.cursor.executemany(
+                """INSERT OR IGNORE INTO events (
+                    guid,
+                    user_id,
+                    instrument_id,
+                    booking_type_id,
+                    start,
+                    end,
+                    duration,
+                    subject
+                ) VALUES (?,?,?,?,?,?,?,?)""",
+                events_to_insert,
+            )
+
+        if attendees_to_insert:
+            self.cursor.executemany(
+                """INSERT INTO attendees (event_id, user_id) VALUES (?,?)""",
+                attendees_to_insert,
+            )
+
+        self.connection.commit()
         return df, duplicates
 
     def load_calendar(self, instrument, url):
@@ -779,8 +835,10 @@ class BookingDB:
 
             txt = None
             if cache_file and cache_file.exists():
+                print(f"Loading cached file {cache_file.name}")
                 txt = cache_file.read_text(encoding="utf-8")
             else:
+                print(f"Fetching cached file {url}")
                 req = request.Request(url)
                 req.add_header("Cookie", self.cookie)
                 with request.urlopen(req, timeout=15) as response:
@@ -788,33 +846,60 @@ class BookingDB:
                 if cache_file and txt:
                     cache_file.write_text(txt, encoding="utf-8")
 
-            # remove VALARM blocks
-            pattern = r"BEGIN:VALARM.*?END:VALARM\n?"
-            flt_txt = re.sub(pattern, "", txt, flags=re.DOTALL)
-
-            c = Calendar(flt_txt)
+            c = Calendar.from_ical(txt)
             rec = []
-            for e in c.events:
-                if e.organizer is not None:
-                    t0 = e.begin.datetime.replace(tzinfo=local_tz)
-                    t1 = e.end.datetime.replace(tzinfo=local_tz)
-                    if e.name is not None:
-                        subject = e.name.lower().replace(
-                            "maintenace", "maintenance"
+            for e in c.walk("VEVENT"):
+                organizer = e.get("ORGANIZER")
+                if organizer is not None:
+                    dtstart = e.get("DTSTART").dt
+                    dtend = e.get("DTEND").dt
+                    t0 = (
+                        dtstart.astimezone(local_tz)
+                        if hasattr(dtstart, "astimezone")
+                        else local_tz.localize(dtstart)
+                    )
+                    t1 = (
+                        dtend.astimezone(local_tz)
+                        if hasattr(dtend, "astimezone")
+                        else local_tz.localize(dtend)
+                    )
+                    raw_summary = e.get("SUMMARY")
+                    if raw_summary is not None:
+                        subject = (
+                            str(raw_summary)
+                            .lower()
+                            .replace("maintenace", "maintenance")
                         )
                     else:
                         subject = "None"
+
+                    raw_attendees = e.get("ATTENDEE", [])
+                    if not isinstance(raw_attendees, list):
+                        raw_attendees = [raw_attendees]
+                    attendees = [
+                        str(a).replace("mailto:", "").replace("MAILTO:", "")
+                        for a in raw_attendees
+                    ]
+
+                    org_email = (
+                        str(organizer).replace("mailto:", "").replace("MAILTO:", "")
+                    )
+                    common_name = (
+                        organizer.params.get("CN", org_email)
+                        if hasattr(organizer, "params")
+                        else org_email
+                    )
                     rec.append(
                         {
-                            "guid": e.uid,
-                            "user": e.organizer.common_name,
-                            "email": str(e.organizer.email).split("@")[0],
+                            "guid": str(e.get("UID")),
+                            "user": common_name,
+                            "email": org_email,
                             "start": t0,
                             "end": t1,
                             "subject": subject,
                             "duration": t1 - t0,
                             "hours": (t1 - t0).total_seconds() / 3600,
-                            "attendees": [x.email for x in e.attendees],
+                            "attendees": attendees,
                         }
                     )
             if not rec:
@@ -825,9 +910,10 @@ class BookingDB:
         except Exception as e:
             print(
                 f"Could not download {url}, update the cookie.txt file.\n"
-                "Open the url, press ctrl-shift-I, press reload,\n "
-                "right click on the lower panel, copy value as cURL\n"
+                "Open the url, press ctrl-shift-I, press reload,right click"
+                " on the lower panel, copy value as cURL\n"
             )
+            print(e)
             return pd.DataFrame(columns=columns)
 
     def create_training_request(self):
@@ -900,26 +986,53 @@ class BookingDB:
                     cache_file.write_text(txt, encoding="utf-8")
 
             rec = []
-            c = Calendar(txt)
-            for k, e in enumerate(c.events):
-                    if e.organizer is not None:
-                        t0 = e.begin.datetime.replace(tzinfo=local_tz)
-                        t1 = e.end.datetime.replace(tzinfo=local_tz)
-                        if e.name is not None:
-                            if e.name.lower().find("training") >= 0:
-                                rec.append(
-                                    {
-                                        "guid": e.uid,
-                                        "user": e.organizer.common_name,
-                                        "email": e.organizer.email,
-                                        "start": t0,
-                                        "end": t1,
-                                        "subject": e.name,
-                                        "duration": t1 - t0,
-                                        "hours": (t1 - t0).total_seconds() / 3600,
-                                        "attendees": [x.email for x in e.attendees],
-                                    }
-                                )
+            c = Calendar.from_ical(txt)
+            for e in c.walk("VEVENT"):
+                organizer = e.get("ORGANIZER")
+                if organizer is not None:
+                    raw_summary = e.get("SUMMARY")
+                    summary_str = str(raw_summary) if raw_summary is not None else ""
+                    if "training" in summary_str.lower():
+                        dtstart = e.get("DTSTART").dt
+                        dtend = e.get("DTEND").dt
+                        t0 = (
+                            dtstart.astimezone(local_tz)
+                            if hasattr(dtstart, "astimezone")
+                            else local_tz.localize(dtstart)
+                        )
+                        t1 = (
+                            dtend.astimezone(local_tz)
+                            if hasattr(dtend, "astimezone")
+                            else local_tz.localize(dtend)
+                        )
+                        raw_attendees = e.get("ATTENDEE", [])
+                        if not isinstance(raw_attendees, list):
+                            raw_attendees = [raw_attendees]
+                        attendees = [
+                            str(a).replace("mailto:", "").replace("MAILTO:", "")
+                            for a in raw_attendees
+                        ]
+                        org_email = (
+                            str(organizer).replace("mailto:", "").replace("MAILTO:", "")
+                        )
+                        common_name = (
+                            organizer.params.get("CN", org_email)
+                            if hasattr(organizer, "params")
+                            else org_email
+                        )
+                        rec.append(
+                            {
+                                "guid": str(e.get("UID")),
+                                "user": common_name,
+                                "email": org_email,
+                                "start": t0,
+                                "end": t1,
+                                "subject": summary_str,
+                                "duration": t1 - t0,
+                                "hours": (t1 - t0).total_seconds() / 3600,
+                                "attendees": attendees,
+                            }
+                        )
             if not rec:
                 return pd.DataFrame(
                     columns=[
