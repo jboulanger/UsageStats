@@ -1,9 +1,11 @@
 import multiprocessing as mp
 import re
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from functools import partial
+from pathlib import Path
 from sqlite3 import Error
 from urllib import request
 
@@ -104,6 +106,7 @@ class BookingDB:
             curl command string to extract the cookie, if None, cookie must be provided
         """
         self.db_file = db_file
+        self.cache_dir = Path(self.db_file).parent / "_cache"
         self.connection = sqlite3.connect(self.db_file)
         self.cursor = self.connection.cursor()
         self.cookie = cookie
@@ -610,14 +613,20 @@ class BookingDB:
         if not rows:
             df = pd.DataFrame(columns=columns)
         else:
-            # def _load_row(row):
-            #     return self.load_calendar(row[0], row[1])
-
-            # with ThreadPoolExecutor(max_workers=min(8, len(rows))) as pool:
-            #     frames = list(pool.map(_load_row, rows))
-
-            # frames = [df for df in frames if df is not None and not df.empty]
-            frames = [self.load_calendar(r[0], r[1]) for r in rows]
+            with ThreadPoolExecutor(max_workers=min(4, len(rows))) as pool:
+                futures = []
+                for i, row in enumerate(rows):
+                    if i > 0:
+                        time.sleep(1.0)
+                    futures.append(pool.submit(self.load_calendar, row[0], row[1]))
+                frames = []
+                for future in as_completed(futures):
+                    try:
+                        res = future.result()
+                        if res is not None and not res.empty:
+                            frames.append(res)
+                    except Exception as e:
+                        print(f"Error loading calendar: {e}")
             if frames:
                 df = pd.concat(frames, ignore_index=True)
             else:
@@ -762,40 +771,52 @@ class BookingDB:
 
         try:
             local_tz = pytz.timezone("Europe/London")
-            req = request.Request(url)
-            req.add_header("Cookie", self.cookie)
+            cache_file = None
+            if self.cache_dir:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                sanitized_name = re.sub(r"[^\w\-_\. ]", "_", instrument).strip()
+                cache_file = self.cache_dir / f"{sanitized_name}.ics"
+
+            txt = None
+            if cache_file and cache_file.exists():
+                txt = cache_file.read_text(encoding="utf-8")
+            else:
+                req = request.Request(url)
+                req.add_header("Cookie", self.cookie)
+                with request.urlopen(req, timeout=15) as response:
+                    txt = response.read().decode("utf-8")
+                if cache_file and txt:
+                    cache_file.write_text(txt, encoding="utf-8")
+
+            # remove VALARM blocks
+            pattern = r"BEGIN:VALARM.*?END:VALARM\n?"
+            flt_txt = re.sub(pattern, "", txt, flags=re.DOTALL)
+
+            c = Calendar(flt_txt)
             rec = []
-            with request.urlopen(req) as response:
-                txt = response.read().decode("utf-8")
-
-                # remove VALARM blocks
-                pattern = r"BEGIN:VALARM.*?END:VALARM\n?"
-                flt_txt = re.sub(pattern, "", txt, flags=re.DOTALL)
-
-                c = Calendar(flt_txt)
-                for e in c.events:
-                    if e.organizer is not None:
-                        t0 = e.begin.datetime.replace(tzinfo=local_tz)
-                        t1 = e.end.datetime.replace(tzinfo=local_tz)
-                        if e.name is not None:
-                            subject = e.name.lower().replace(
-                                "maintenace", "maintenance"
-                            )
-                        else:
-                            subject = "None"
-                        rec.append(
-                            {
-                                "guid": e.uid,
-                                "user": e.organizer.common_name,
-                                "email": e.organizer.email,
-                                "start": t0,
-                                "end": t1,
-                                "subject": subject,
-                                "duration": t1 - t0,
-                                "hours": (t1 - t0).total_seconds() / 3600,
-                                "attendees": [x.email for x in e.attendees],
-                            }
+            for e in c.events:
+                if e.organizer is not None:
+                    t0 = e.begin.datetime.replace(tzinfo=local_tz)
+                    t1 = e.end.datetime.replace(tzinfo=local_tz)
+                    if e.name is not None:
+                        subject = e.name.lower().replace(
+                            "maintenace", "maintenance"
                         )
+                    else:
+                        subject = "None"
+                    rec.append(
+                        {
+                            "guid": e.uid,
+                            "user": e.organizer.common_name,
+                            "email": str(e.organizer.email).split("@")[0],
+                            "start": t0,
+                            "end": t1,
+                            "subject": subject,
+                            "duration": t1 - t0,
+                            "hours": (t1 - t0).total_seconds() / 3600,
+                            "attendees": [x.email for x in e.attendees],
+                        }
+                    )
             if not rec:
                 return pd.DataFrame(columns=columns)
             df = pd.DataFrame.from_records(rec, columns=columns[:-1])
@@ -861,13 +882,26 @@ class BookingDB:
         """
         try:
             local_tz = pytz.timezone("Europe/London")
-            req = request.Request(url)
-            req.add_header("Cookie", self.cookie)
+            cache_file = None
+            if self.cache_dir:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                sanitized_name = re.sub(r"[^\w\-_\. ]", "_", instrument).strip()
+                cache_file = self.cache_dir / f"{sanitized_name}.ics"
+
+            txt = None
+            if cache_file and cache_file.exists():
+                txt = cache_file.read_text(encoding="utf-8")
+            else:
+                req = request.Request(url)
+                req.add_header("Cookie", self.cookie)
+                with request.urlopen(req, timeout=15) as response:
+                    txt = response.read().decode("utf-8")
+                if cache_file and txt:
+                    cache_file.write_text(txt, encoding="utf-8")
+
             rec = []
-            with request.urlopen(req) as response:
-                txt = response.read().decode("utf-8")
-                c = Calendar(txt)
-                for k, e in enumerate(c.events):
+            c = Calendar(txt)
+            for k, e in enumerate(c.events):
                     if e.organizer is not None:
                         t0 = e.begin.datetime.replace(tzinfo=local_tz)
                         t1 = e.end.datetime.replace(tzinfo=local_tz)
