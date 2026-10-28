@@ -1,15 +1,28 @@
 import pandas as pd
 from datetime import datetime, timedelta
 import pytz
-import numpy as np
 import re
 from ics import Calendar
 import multiprocessing as mp
-from urllib import request
 
 
 def daterange(start, end, step):
-    """Range of dates generator"""
+    """Range of dates generator
+
+    Parameters
+    ----------
+    start: datetime
+        start date
+    end: datetime
+        end date
+    step: timedelta
+        step size, e.g. timedelta(days=7)
+
+    Yields
+    -------
+    datetime
+        next date in the range
+    """
     curr = start
     while curr < end:
         yield curr
@@ -17,7 +30,20 @@ def daterange(start, end, step):
 
 
 def get_booking_type(x, type_list):
-    """Get the type of booking by matching test from type list"""
+    """Get the type of booking by matching test from type list
+
+    Parameters
+    ----------
+    x: str
+        subject of the booking
+    type_list: list of str
+        list of booking types to match against
+
+    Returns
+    -------
+    str
+        type of booking, if no match is found returns "standard"
+    """
     for t in type_list:
         if x.lower().find(t) != -1:
             return t
@@ -25,7 +51,18 @@ def get_booking_type(x, type_list):
 
 
 def to_date_time(str):
-    """Convert a string to a datetime"""
+    """Convert a string to a datetime
+
+    Parameters
+    ----------
+    str: str
+        string to convert, e.g. "Mon 01/01/2020 12:00" or "2020/01/01 12:00:00"
+
+    Returns
+    -------
+    datetime
+        datetime object with timezone information set to Europe/London
+    """
     try:
         date = pd.to_datetime(str, format="%a %d/%m/%Y %H:%M")
     except (TypeError, ValueError):
@@ -36,6 +73,18 @@ def to_date_time(str):
 
 
 def calendar_to_instrument_name(x):
+    """Convert a calendar name to an instrument name
+
+    Parameters
+    ----------
+    x: pathlib.Path
+        path to the calendar file, e.g. "Calendar of resource 'Nikon_W1_1N180@mrc-lmb.cam.ac.uk'
+
+    Returns
+    -------
+    str
+        instrument name, e.g. 'Nikon W1'
+    """
     y = (
         x.stem.replace("Calendar of resource '", "")
         .replace("@mrc-lmb.cam.ac.uk'", "")
@@ -49,6 +98,20 @@ def calendar_to_instrument_name(x):
 
 
 def load_instruments(file_list):
+    """Load instruments from a list of calendar files
+
+    Parameters
+    ----------
+    file_list: list of pathlib.Path
+        list of calendar files
+
+    Returns
+    -------
+    pd.DataFrame
+        dataframe with Instrument and Calendar columns, where Instrument is the name of the instrument
+        and Calendar is the path to the calendar file.
+
+    """
     calendars = [x for x in file_list]
     instruments = pd.DataFrame(
         {
@@ -59,14 +122,22 @@ def load_instruments(file_list):
     return instruments
 
 
-def load_ics(filename, instrument_name, booking_types):
+def load_ics(
+    filename,
+    instrument_name,
+    booking_types=["standard", "maintenance", "training", "service"],
+):
     """Load data from an ics calendar file
+
     Parameters
     ----------
     filename: str | pathlib.Path
         path to the ics file
+    instrument_name: str
+        name of the instrument, e.g. 'Nikon W1'
     booking_types: list(str)
         list of the type of bookings
+        e.g. ['standard', 'maintenance', 'training','service']
     Result
     ------
     bookings: pd.DataFrame

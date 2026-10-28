@@ -1,17 +1,34 @@
-import sqlite3
-from sqlite3 import Error
-import re
-from ics import Calendar
-from datetime import datetime, timedelta
-import pytz
-import pandas as pd
 import multiprocessing as mp
-from urllib import request
+import re
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from functools import partial
+from sqlite3 import Error
+from urllib import request
+
+import pandas as pd
+import pytz
+from ics import Calendar
 
 
 def daterange(start, end, step):
-    """Range of dates generator"""
+    """Range of dates generator
+
+    Parameters
+    ----------
+    start: datetime
+        start date
+    end: datetime
+        end date
+    step: timedelta
+        step size, e.g. timedelta(days=7)
+
+    Yields
+    -------
+    datetime
+        next date in the range
+    """
     curr = start
     while curr < end:
         yield curr
@@ -19,7 +36,19 @@ def daterange(start, end, step):
 
 
 def load_ics(args):
-    """Load data from an ics calendar file"""
+    """Load data from an ics calendar file
+
+    Parameters
+    ----------
+    args: tuple
+        (id, filename) where id is the instrument id and filename is the path to the ics file
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns: guid, user, email, start, end, subject, duration, hours, instrument_id
+
+    """
     id, filename = args
     local_tz = pytz.timezone("Europe/London")
     rec = []
@@ -55,7 +84,7 @@ class BookingDB:
 
     Represent a connection to the booking db
 
-    use with a context manager:
+    use with a context manager
     ```
     with BookingDB('file.db') as bookings:
         bookings.create_booking_types(types)
@@ -63,6 +92,17 @@ class BookingDB:
     """
 
     def __init__(self, db_file, cookie=None, curl_str=None):
+        """Create a BookingDB instance
+
+        Parameters
+        ----------
+        db_file: str
+            path to the sqlite database file
+        cookie: str, optional
+            cookie string to use for authentication, if None, it will be set from curl_str
+        curl_str: str, optional
+            curl command string to extract the cookie, if None, cookie must be provided
+        """
         self.db_file = db_file
         self.connection = sqlite3.connect(self.db_file)
         self.cursor = self.connection.cursor()
@@ -70,9 +110,11 @@ class BookingDB:
         self.set_cookie_from_curl(curl_str)
 
     def __enter__(self):
+        """Enter the context manager"""
         return self
 
     def __exit__(self, ext_type, exc_value, traceback):
+        """Exit the context manager"""
         self.cursor.close()
         if isinstance(exc_value, Exception):
             self.connection.rollback()
@@ -81,6 +123,18 @@ class BookingDB:
         self.connection.close()
 
     def calendar_to_instrument_name(self, x):
+        """Convert a calendar name to an instrument name
+
+        Parameters
+        ----------
+        x: str
+            calendar name, e.g. "Calendar of resource 'Nikon W1 @mrc-lmb.cam.ac.uk'
+
+        Returns
+        -------
+        str
+            instrument name, e.g. 'Nikon W1'
+        """
         y = (
             x.stem.replace("Calendar of resource '", "")
             .replace("@mrc-lmb.cam.ac.uk'", "")
@@ -93,6 +147,14 @@ class BookingDB:
         )
 
     def create_booking_types(self, booking_types):
+        """Create the booking types table from a list of booking types
+
+        Parameters
+        ----------
+        booking_types: list of str
+            list of booking types, e.g. ["standard", "maintenance", "training", "service"]
+
+        """
         self.cursor.execute(
             """CREATE TABLE IF NOT EXISTS booking_types (
                 id integer PRIMARY KEY,
@@ -112,6 +174,13 @@ class BookingDB:
                 pass
 
     def create_division(self, divisions):
+        """Create the divisions table from a list of divisions
+
+        Parameters
+        ----------
+        divisions: list of str
+            list of divisions, e.g. ["Division A", "Division B", "Division C"]
+        """
         self.cursor.execute(
             """CREATE TABLE IF NOT EXISTS divisions (
                 id integer PRIMARY KEY,
@@ -138,6 +207,18 @@ class BookingDB:
                 pass
 
     def get_division_id(self, name):
+        """Get the division id by name
+
+        Parameters
+        ----------
+        name: str
+            name of the division, e.g. "Cell Biology
+
+        Returns
+        -------
+        int
+            id of the division, if not found returns 0
+        """
         self.cursor.execute("""SELECT rowid FROM divisions WHERE name=?""", (name,))
         row = self.cursor.fetchone()
         if row is None:
@@ -146,6 +227,19 @@ class BookingDB:
             return row[0]
 
     def create_groups(self, groups: pd.DataFrame):
+        """Create the groups table from a dataframe
+
+        Parameters
+        ----------
+        groups: pd.DataFrame
+            dataframe with columns Group, Division
+            e.g.:
+            | Group      | Division       |
+            |------------|----------------|
+            | Munro      | Cell biology   |
+            | Greger     | Neurobiology   |
+
+        """
         self.cursor.execute(
             """CREATE TABLE IF NOT EXISTS groups (
                 id integer PRIMARY KEY,
@@ -175,7 +269,20 @@ class BookingDB:
                 pass
 
     def create_calendars_from_df(self, calendars):
-        """Create the calendar table from a dataframe"""
+        """Create the calendar table from a dataframe
+
+        Parameters
+        ----------
+        calendars: pd.DataFrame
+            dataframe with columns url, instrument, pc, confocal
+            e.g.:
+            | url                          | instrument | pc | confocal |
+            |------------------------------|------------|----|----------|
+            | http://example.com/calendar1 | Nikon W1   | 1  | 0        |
+            | http://example.com/calendar2 | Zeiss LSM  | 0  | 1        |
+
+        """
+        # create the calendars table
         self.cursor.execute(
             """CREATE TABLE IF NOT EXISTS calendars (
                 id integer PRIMARY KEY,
@@ -186,6 +293,7 @@ class BookingDB:
                 )"""
         )
         self.connection.commit()
+        # add the calendars
         for row in calendars.iloc:
             try:
                 self.cursor.execute(
@@ -203,8 +311,11 @@ class BookingDB:
                 pass
 
     def create_instruments(self):
-        """Create the instruments table from the calendars table"""
+        """Create the instruments table from the calendars table
 
+        This will create a table with unique instrument names from the calendars table.
+        """
+        # create the instruments table
         self.cursor.execute(
             """CREATE TABLE IF NOT EXISTS instruments (
                 id integer PRIMARY KEY,
@@ -213,6 +324,8 @@ class BookingDB:
         )
 
         self.cursor.execute("""SELECT instrument FROM calendars""")
+
+        # add the instruments
         rows = self.cursor.fetchall()
         for row in rows:
             try:
@@ -223,10 +336,21 @@ class BookingDB:
                 self.connection.commit()
             except Error as e:
                 # print(e)
-                pass  #
+                pass
 
     def get_booking_type(self, x):
-        """Get the type of booking by matching test from type list"""
+        """Get the type of booking by matching test from type list
+
+        Parameters
+        ----------
+        x: str
+            subject of the booking, e.g. "Jean-Paul", "Maintenance", "Training"
+
+        Returns
+        -------
+        int
+            id of the booking type, if not found returns 1 (standard booking)
+        """
         self.cursor.execute(
             """SELECT rowid,name FROM booking_types WHERE name=?""", (x.lower(),)
         )
@@ -237,7 +361,18 @@ class BookingDB:
             return row[0]
 
     def get_instrument_id(self, x):
-        """Get the type of booking by matching test from type list"""
+        """Get the id of the instrument by name
+
+        Parameters
+        ----------
+        x: str
+            name of the instrument, e.g. "Nikon W1", "Zeiss LSM"
+
+        Returns
+        -------
+        int
+            id of the instrument, if not found returns 1 (default instrument)
+        """
         self.cursor.execute("""SELECT rowid,name FROM instruments WHERE name=?""", (x,))
         row = self.cursor.fetchone()
         if row is None:
@@ -246,7 +381,20 @@ class BookingDB:
             return row[0]
 
     def get_usage(self, week, bookings):
-        """Get the amount of usage in hours per week"""
+        """Get the amount of usage in hours per week
+
+        Parameters
+        ----------
+        week: pd.Series
+            Series with columns Start and End, representing the week
+        bookings: pd.DataFrame
+            DataFrame with columns start and end, representing the bookings
+
+        Returns
+        -------
+        float
+            total usage in hours for the week
+        """
         print(week)
         s = 0.0
         for booking in bookings.iloc:
@@ -258,6 +406,23 @@ class BookingDB:
         return s
 
     def get_weekly_usage(self, events, start_date, end_date):
+        """Get the weekly usage in hours for a given date range
+
+        Parameters
+        ----------
+        events: pd.DataFrame
+            DataFrame with columns start and end, representing the bookings
+        start_date: datetime
+            start date of the range
+        end_date: datetime
+            end date of the range
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns Week, Start, End, Usage
+            where Usage is the total usage in hours for each week
+        """
         weeks_start = [d for d in daterange(start_date, end_date, timedelta(days=7))]
         df = pd.DataFrame(
             {
@@ -288,8 +453,7 @@ class BookingDB:
             return row[0]
 
     def create_users(self, users):
-        """
-        create the users table
+        """Create the users table
 
         Parameters
         ----------
@@ -383,6 +547,7 @@ class BookingDB:
                 events.start AS 'start',
                 events.end AS 'end',
                 users.name AS 'user',
+                users.email as 'email',
                 groups.name AS 'group',
                 divisions.name AS 'division',
                 instruments.name as 'instrument',
@@ -412,27 +577,61 @@ class BookingDB:
         return events
 
     def create_events(self, users):
+        """Create the events table from the calendars
+
+        Parameters
+        ----------
+        users: pd.DataFrame
+            DataFrame with columns user, email, group, division
+            e.g.:
+            | user       | email                | group   | division       |
+            |------------|----------------------|---------|----------------|
+            | Jean-Paul  | jp@mrc-lmb.cam.ac.uk | Munro   | Cell Biology   |
+
+        """
+        columns = [
+            "guid",
+            "user",
+            "email",
+            "start",
+            "end",
+            "subject",
+            "duration",
+            "hours",
+            "attendees",
+            "instrument",
+        ]
         # get the list of instruments
         self.cursor.execute("""SELECT instrument, url FROM calendars""")
         rows = self.cursor.fetchall()
 
-        # load all calendars as a dataframe
-        # with mp.Pool() as pool:
-        #    df = pool.map(partial(load_calendar, cookie=self.cookie), rows, chunksize=1)
-        #
-        #    df = pd.concat(df)
-        df = pd.concat(
-            [self.load_calendar(r[0], r[1]) for r in rows], ignore_index=True
-        )
+        # load all calendars in parallel, but keep the database writes serial
+        print("load cal")
+        if not rows:
+            df = pd.DataFrame(columns=columns)
+        else:
+            # def _load_row(row):
+            #     return self.load_calendar(row[0], row[1])
+
+            # with ThreadPoolExecutor(max_workers=min(8, len(rows))) as pool:
+            #     frames = list(pool.map(_load_row, rows))
+
+            # frames = [df for df in frames if df is not None and not df.empty]
+            frames = [self.load_calendar(r[0], r[1]) for r in rows]
+            if frames:
+                df = pd.concat(frames, ignore_index=True)
+            else:
+                df = pd.DataFrame(columns=columns)
 
         # get the users from the list of events merge with known users
         all_users = (
-            df[["user", "email"]]
+            df[["email", "user"]]
             .drop_duplicates()
-            .merge(users, how="left", on="user")
+            .merge(users[["email", "group"]], how="left", on="email")
             .fillna("Unknown")
         )
 
+        print("create users")
         self.create_users(all_users)
 
         # create event table
@@ -456,9 +655,29 @@ class BookingDB:
         )
         self.connection.commit()
 
+        # create the attendees table
+        self.cursor.execute(
+            """CREATE TABLE IF NOT EXISTS attendees (
+                id INTEGER PRIMARY KEY,
+                event_id INTEGER,
+                user_id INTEGER,
+                FOREIGN KEY (event_id) REFERENCES events (id)
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )"""
+        )
+        print("create events")
         # insert events
         duplicates = []
         for event in df.iloc:
+            # check if the event already exists
+            self.cursor.execute(
+                """SELECT id FROM events WHERE guid=?""",
+                (event["guid"],),
+            )
+            if self.cursor.fetchone() is not None:
+                # if it exists, skip it
+                duplicates.append(event["guid"])
+                continue
             try:
                 uid = int(self.get_user_id(event["email"]))
                 iid = int(self.get_instrument_id(event["instrument"]))
@@ -486,14 +705,61 @@ class BookingDB:
                     ),
                 )
                 self.connection.commit()
-            except Error as error:
+            except Error:
                 # print("error in events", error, event["guid"])
                 duplicates.append(event["guid"])
+
+            # insert attendees of the event to the attendees table
+            # if the user is not in the users table, it will be skipped
+            for attendee in event["attendees"]:
+                uid = self.get_user_id(attendee)
+                if uid > 0:
+                    self.cursor.execute(
+                        """INSERT INTO attendees (event_id, user_id) VALUES (?,?)""",
+                        (event["guid"], uid),
+                    )
+                    self.connection.commit()
 
         return df, duplicates
 
     def load_calendar(self, instrument, url):
-        print(instrument)
+        """Load the calendar from a url into a dataframe
+
+        Parameters
+        ----------
+        instrument: str
+            name of the instrument, e.g. "Nikon W1"
+        url: str
+            url of the calendar, e.g. "http://example.com/calendar.ics
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns guid, user, email, start, end, subject, duration, hours, instrument
+            where guid is the unique identifier of the event, user is the name of the organizer,
+            email is the email of the organizer, start and end are the start and end times of the event,
+            subject is the name of the event, duration is the duration of the event in timedelta,
+            hours is the duration in hours, and instrument is the name of the instrument.
+
+        Notes
+        -----
+        This function uses the cookie set in the BookingDB instance to authenticate the request.
+        If the cookie is not set, it will raise an exception.
+        """
+
+        columns = [
+            "guid",
+            "user",
+            "email",
+            "start",
+            "end",
+            "subject",
+            "duration",
+            "hours",
+            "attendees",
+            "instrument",
+        ]
+
         try:
             local_tz = pytz.timezone("Europe/London")
             req = request.Request(url)
@@ -501,8 +767,13 @@ class BookingDB:
             rec = []
             with request.urlopen(req) as response:
                 txt = response.read().decode("utf-8")
-                c = Calendar(txt)
-                for k, e in enumerate(c.events):
+
+                # remove VALARM blocks
+                pattern = r"BEGIN:VALARM.*?END:VALARM\n?"
+                flt_txt = re.sub(pattern, "", txt, flags=re.DOTALL)
+
+                c = Calendar(flt_txt)
+                for e in c.events:
                     if e.organizer is not None:
                         t0 = e.begin.datetime.replace(tzinfo=local_tz)
                         t1 = e.end.datetime.replace(tzinfo=local_tz)
@@ -522,17 +793,148 @@ class BookingDB:
                                 "subject": subject,
                                 "duration": t1 - t0,
                                 "hours": (t1 - t0).total_seconds() / 3600,
+                                "attendees": [x.email for x in e.attendees],
                             }
                         )
+            if not rec:
+                return pd.DataFrame(columns=columns)
+            df = pd.DataFrame.from_records(rec, columns=columns[:-1])
+            df["instrument"] = instrument
+            return df
+        except Exception as e:
+            print(
+                f"Could not download {url}, update the cookie.txt file.\n"
+                "Open the url, press ctrl-shift-I, press reload,\n "
+                "right click on the lower panel, copy value as cURL\n"
+            )
+            return pd.DataFrame(columns=columns)
+
+    def create_training_request(self):
+        self.cursor.execute("""SELECT instrument, url FROM calendars""")
+        rows = self.cursor.fetchall()
+        frames = [self.load_training(r[0], r[1]) for r in rows]
+        frames = [df for df in frames if df is not None and not df.empty]
+        if frames:
+            df = pd.concat(frames, ignore_index=True)
+        else:
+            df = pd.DataFrame(
+                columns=[
+                    "guid",
+                    "user",
+                    "email",
+                    "start",
+                    "end",
+                    "subject",
+                    "duration",
+                    "hours",
+                    "attendees",
+                    "instrument",
+                ]
+            )
+        return df
+
+    def load_training(self, instrument, url):
+        """Load the calendar from a url into a dataframe filtered for training requests and listing all attendees
+
+        Parameters
+        ----------
+        instrument: str
+            name of the instrument, e.g. "Nikon W1"
+        url: str
+            url of the calendar, e.g. "http://example.com/calendar.ics
+
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with columns guid, user, email, start, end, subject, duration, hours, instrument, attendees
+            where guid is the unique identifier of the event, user is the name of the organizer,
+            email is the email of the organizer, start and end are the start and end times of the event,
+            subject is the name of the event, duration is the duration of the event in timedelta,
+            hours is the duration in hours, instrument is the name of the instrument,
+            and attendees is a list of emails of all attendees.
+
+        Notes
+        -----
+        - This function uses the cookie set in the BookingDB instance to authenticate the request.
+          If the cookie is not set, it will raise an exception.
+        - Instead a attendees table should be created to store the attendees.
+        """
+        try:
+            local_tz = pytz.timezone("Europe/London")
+            req = request.Request(url)
+            req.add_header("Cookie", self.cookie)
+            rec = []
+            with request.urlopen(req) as response:
+                txt = response.read().decode("utf-8")
+                c = Calendar(txt)
+                for k, e in enumerate(c.events):
+                    if e.organizer is not None:
+                        t0 = e.begin.datetime.replace(tzinfo=local_tz)
+                        t1 = e.end.datetime.replace(tzinfo=local_tz)
+                        if e.name is not None:
+                            if e.name.lower().find("training") >= 0:
+                                rec.append(
+                                    {
+                                        "guid": e.uid,
+                                        "user": e.organizer.common_name,
+                                        "email": e.organizer.email,
+                                        "start": t0,
+                                        "end": t1,
+                                        "subject": e.name,
+                                        "duration": t1 - t0,
+                                        "hours": (t1 - t0).total_seconds() / 3600,
+                                        "attendees": [x.email for x in e.attendees],
+                                    }
+                                )
+            if not rec:
+                return pd.DataFrame(
+                    columns=[
+                        "guid",
+                        "user",
+                        "email",
+                        "start",
+                        "end",
+                        "subject",
+                        "duration",
+                        "hours",
+                        "attendees",
+                        "instrument",
+                    ]
+                )
             df = pd.DataFrame.from_records(rec)
             df["instrument"] = instrument
             return df
         except Exception as e:
             print(f"Cound not download {url}")
             print(e)
-            return None
+            return pd.DataFrame(
+                columns=[
+                    "guid",
+                    "user",
+                    "email",
+                    "start",
+                    "end",
+                    "subject",
+                    "duration",
+                    "hours",
+                    "attendees",
+                    "instrument",
+                ]
+            )
 
     def set_cookie_from_curl(self, curl_str):
+        """Set the cookie from a curl string
+
+        Parameters
+        ----------
+        curl_str: str
+            curl command string, e.g. "curl -H 'Cookie: session=abc123' http://example.com/calendar.ics"
+
+        Raises
+        ------
+        Exception
+            if the cookie is not found in the curl string
+        """
         if curl_str is not None:
             x = curl_str.split(" ")
             k = x.index("'Cookie:")
