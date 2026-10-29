@@ -472,17 +472,31 @@ class BookingDB:
         else:
             return row[0]
 
-    def create_users(self, users):
+    def create_users_table(self, users):
         """Create the users table
 
         Parameters
         ----------
-        users: pd.Dataframe
+        users: pd.DataFrame
             dataframe with user, email, group
+            e.g.:
+            |uid | user       | email                | group   |
+            |----|------------|----------------------|---------|
+            |jp  | Jean-Paul  | jp@mrc-lmb.cam.ac.uk | Munro   |
+
+        Schema
+        ------
+        CREATE TABLE IF NOT EXISTS users (
+            id text PRIMARY KEY,
+            name text,
+            group_id integer,
+            email text UNIQUE,
+            FOREIGN KEY (group_id) REFERENCES groups (id)
+        )
         """
         self.cursor.execute(
             """CREATE TABLE IF NOT EXISTS users (
-                id integer PRIMARY KEY,
+                id text PRIMARY KEY,
                 name text,
                 group_id integer,
                 email text UNIQUE,
@@ -499,12 +513,13 @@ class BookingDB:
         for u in users.iloc:
             gid = group_map.get(u["group"], 0)
             name = u["user"]
-            email = str(u["email"]).split("@")[0] if pd.notna(u["email"]) else ""
-            user_records.append((name, gid, email))
+            email = u["email"]
+            uid = u["uid"]
+            user_records.append((uid, name, gid, email))
 
         if user_records:
             self.cursor.executemany(
-                """INSERT OR IGNORE INTO users (name, group_id, email) VALUES (?,?,?)""",
+                """INSERT INTO users (id, name, group_id, email) VALUES (?,?,?,?)""",
                 user_records,
             )
             self.connection.commit()
@@ -526,6 +541,7 @@ class BookingDB:
         )
         q = """
         SELECT DISTINCT
+            COALESCE(users.id, 'Unknown') as 'id',
             COALESCE(users.name, 'Unknown') as 'name',
             COALESCE(users.email, 'Unknown') as 'email',
             COALESCE(groups.name, 'Unknown') as 'group',
@@ -539,7 +555,7 @@ class BookingDB:
         """
         return pd.read_sql_query(q, self.connection, params=(start_str, end_str))
 
-    def get_user_id(self, email):
+    def get_user_id_from_email(self, email):
         """Get the user id by matching email (or username before @)"""
         user_key = str(email).split("@")[0] if pd.notna(email) else ""
         self.cursor.execute("""SELECT id FROM users WHERE email=?""", (user_key,))
@@ -551,15 +567,24 @@ class BookingDB:
 
     def update_users_group_from_df(self, df):
         """update groups in user table from a dataframe with columns Group and User"""
+        data = []
         for u in df.iloc:
-            gid = self.get_group_id(u["group"])
-            self.cursor.execute(
-                """UPDATE users
-                   SET group_id = ?
-                   WHERE name = ?""",
-                (gid, u["user"]),
-            )
-            self.connection.commit()
+            data.append((self.get_group_id(u["group"]), u["id"]))
+        print(data)
+        self.cursor.executemany(
+            """UPDATE users
+               SET group_id = ?
+               WHERE id = ?""",
+            data,
+        )
+        # gid = self.get_group_id(u["group"])
+        # self.cursor.execute(
+        #     """UPDATE users
+        #        SET group_id = ?
+        #        WHERE id = ?""",
+        #     (gid, u["id"]),
+        # )
+        self.connection.commit()
 
     def get_events_in_range(self, start_date, end_date):
         """Get all events in date range
@@ -620,7 +645,7 @@ class BookingDB:
         Parameters
         ----------
         users: pd.DataFrame
-            DataFrame with columns user, email, group, division
+            DataFrame with columns user, email, group, division to roll over from previous years.
             e.g.:
             | user       | email                | group   | division       |
             |------------|----------------------|---------|----------------|
@@ -644,7 +669,6 @@ class BookingDB:
         rows = self.cursor.fetchall()
 
         # load all calendars in parallel, but keep the database writes serial
-        print("load cal")
         if not rows:
             df = pd.DataFrame(columns=columns)
         else:
@@ -652,7 +676,7 @@ class BookingDB:
                 futures = []
                 for i, row in enumerate(rows):
                     if i > 0:
-                        time.sleep(1.0)  # stagger the requests
+                        time.sleep(0.1)  # stagger the requests
                     futures.append(pool.submit(self.load_calendar, row[0], row[1]))
                 frames = []
                 for future in as_completed(futures):
@@ -667,16 +691,27 @@ class BookingDB:
             else:
                 df = pd.DataFrame(columns=columns)
 
-        # get the users from the list of events merge with known users
-        all_users = (
-            df[["email", "user"]]
-            .drop_duplicates()
-            .merge(users[["email", "group"]], how="left", on="email")
-            .fillna("Unknown")
-        )
+        # get the users from the list of events merge with known userss
+        df_users = df[["uid", "email", "user"]].drop_duplicates("uid").copy()
 
-        print("create users")
-        self.create_users(all_users)
+        known_users = users.copy()
+        known_users.rename(columns={c: str(c).lower() for c in known_users.columns})
+        if "email" in known_users.columns:
+            known_users["uid"] = [str(e).split("@")[0] for e in known_users["email"]]
+            all_users = df_users.merge(
+                known_users[["uid", "group"]].drop_duplicates("uid"),
+                how="left",
+                on="uid",
+            ).fillna("Unknown")
+        else:
+            # get the email from df_users matching the name of the users
+            all_users = df_users.merge(
+                known_users[["user", "group"]].drop_duplicates("user"),
+                how="left",
+                on="user",
+            ).fillna("Unknown")
+
+        self.create_users_table(all_users)
 
         # create event table
         # add UNIQUE(guid),
@@ -709,7 +744,7 @@ class BookingDB:
                 FOREIGN KEY (user_id) REFERENCES users (id)
             )"""
         )
-        print("create events")
+
         # pre-load mappings into memory for O(1) lookups
         self.cursor.execute("""SELECT email, id FROM users""")
         user_map = dict(self.cursor.fetchall())
@@ -738,9 +773,9 @@ class BookingDB:
             org_key = (
                 str(event["email"]).split("@")[0] if pd.notna(event["email"]) else ""
             )
-            uid = int(user_map.get(org_key, user_map.get(event["email"], 0)))
-            iid = int(instrument_map.get(event["instrument"], 1))
-            bid = int(booking_type_map.get(str(event["subject"]).lower(), 1))
+            uid = user_map.get(org_key, user_map.get(event["email"], "Unknown"))
+            iid = int(instrument_map.get(event["instrument"], 0))
+            bid = int(booking_type_map.get(str(event["subject"]).lower(), 0))
 
             events_to_insert.append(
                 (
@@ -758,9 +793,8 @@ class BookingDB:
             # collect attendees of the event
             for attendee in event["attendees"]:
                 att_key = str(attendee).split("@")[0] if pd.notna(attendee) else ""
-                a_uid = user_map.get(att_key, user_map.get(attendee, 0))
-                if a_uid > 0:
-                    attendees_to_insert.append((guid, a_uid))
+                a_uid = user_map.get(att_key, user_map.get(attendee, "Unknown"))
+                attendees_to_insert.append((guid, a_uid))
 
         # batch insert events and attendees with a single transaction commit
         if events_to_insert:
@@ -800,7 +834,7 @@ class BookingDB:
         Returns
         -------
         pd.DataFrame
-            DataFrame with columns guid, user, email, start, end, subject, duration, hours, instrument
+            DataFrame with columns uid, guid, user, email, start, end, subject, duration, hours, instrument
             where guid is the unique identifier of the event, user is the name of the organizer,
             email is the email of the organizer, start and end are the start and end times of the event,
             subject is the name of the event, duration is the duration of the event in timedelta,
@@ -814,6 +848,7 @@ class BookingDB:
 
         columns = [
             "guid",
+            "uid",
             "user",
             "email",
             "start",
@@ -892,6 +927,7 @@ class BookingDB:
                     rec.append(
                         {
                             "guid": str(e.get("UID")),
+                            "uid": str(org_email).split("@")[0],
                             "user": common_name,
                             "email": org_email,
                             "start": t0,
